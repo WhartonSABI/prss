@@ -1,0 +1,349 @@
+---
+title: "Victoria code for pressure"
+output: html_notebook
+---
+
+Load in libraries
+
+```{r}
+library(tidyverse)
+library(deldir)
+library(nflfastR)
+install.packages('zoo')
+library(zoo)
+```
+
+Read in data
+```{r}
+# Load data efficiently
+tracking_data <- read.csv('../data//big_data_bowl_2023_AllWeeks.csv') 
+plays <- read_csv("../data/plays.csv", show_col_types = FALSE)
+players <- read_csv("../data/players.csv", show_col_types = FALSE)
+
+```
+
+Data cleaning
+```{r}
+head(tracking_data)
+tracking_data <- tracking_data %>%
+  filter(week %in% 1:5)
+
+tracking <- tracking_data %>%
+  left_join(players %>% select(nflId), by = "nflId")
+
+week_play_ids <- tracking %>% distinct(gameId, playId)
+```
+
+Filter
+```{r}
+relevant_positions <- c("QB", "OL", "DL", "LB", "TE", "CB", "S")
+
+compute_qb_area <- function(play_data) {
+  snap_vals <- play_data$frameId[play_data$event == "ball_snap"]
+  release_vals <- play_data$frameId[play_data$event %in% c("pass_forward", "qb_sack", "qb_spike")]
+
+  if (length(snap_vals) == 0 || length(release_vals) == 0) {
+    return(tibble(qb = NA_character_, max_neg_change = NA_real_))
+  }
+
+  snap_frame <- min(snap_vals, na.rm = TRUE)
+  release_frame <- min(release_vals, na.rm = TRUE)
+
+  if (!is.finite(snap_frame) || !is.finite(release_frame)) {
+    return(tibble(qb = NA_character_, max_neg_change = NA_real_))
+  }
+
+  play_data <- play_data %>%
+    filter(frameId >= snap_frame, frameId <= release_frame)
+
+  qb_name <- play_data %>%
+    filter(officialPosition == "QB") %>%
+    distinct(displayName) %>%
+    pull() %>%
+    paste(collapse = "/")
+
+  frames <- unique(play_data$frameId)
+  if (length(frames) < 6) {
+    return(tibble(qb = qb_name, max_neg_change = NA_real_))
+  }
+
+  qb_areas <- map_dfr(frames, function(f) {
+    frame_data <- play_data %>%
+      filter(frameId == f, !is.na(x), !is.na(y)) %>%
+      filter(officialPosition %in% relevant_positions) %>%
+      distinct(x, y, .keep_all = TRUE)
+
+    if (nrow(frame_data) < 3) return(tibble(frameId = f, qb_area = NA_real_))
+
+    tryCatch({
+      vor <- deldir(frame_data$x, frame_data$y)
+      vor_df <- vor$summary %>%
+        select(x, y, dir.area) %>%
+        left_join(frame_data, by = c("x", "y"))
+      qb_area <- vor_df %>%
+        filter(officialPosition == "QB") %>%
+        pull(dir.area)
+      tibble(frameId = f, qb_area = ifelse(length(qb_area) > 0, qb_area, NA_real_))
+    }, error = function(e) tibble(frameId = f, qb_area = NA_real_))
+  }) %>%
+    arrange(frameId) %>%
+    mutate(rate_change = c(NA, diff(qb_area)))
+
+  qb_areas <- qb_areas %>%
+    mutate(rolling_avg = suppressWarnings(zoo::rollmean(rate_change, k = 5, align = "left", fill = NA)))
+
+  max_neg <- suppressWarnings(min(qb_areas$rolling_avg, na.rm = TRUE))
+  if (!is.finite(max_neg)) max_neg <- NA_real_
+
+  tibble(qb = qb_name, max_neg_change = max_neg)
+}
+```
+
+Compute 
+```{r}
+five_weeks_summary <- tracking %>%
+  group_by(gameId, playId) %>%
+  group_modify(~compute_qb_area(.x)) %>%
+  ungroup()
+
+
+```
+
+Merge with nflfastr
+```{r}
+pbp <- nflfastR::load_pbp(2021)
+pbp <- pbp %>%
+  mutate(playId = play_id) %>%
+  select(playId, yards_gained) 
+
+# Merge summaries for a week worth of games
+final_week_summary <- five_weeks_summary %>%
+  mutate(playId = as.numeric(playId)) %>%
+  left_join(pbp, by = "playId") %>%
+  filter(!is.na(max_neg_change), !is.na(yards_gained))
+```
+
+Plot
+```{r}
+ggplot(final_week_summary, aes(x = abs(max_neg_change), y = yards_gained)) +
+  geom_point(alpha = 0.7, color = "lightcoral") +
+  labs(
+    title = " PRSS vs yards_gained",
+    x = "PRSS",
+    y = "yards_gained"
+  ) +
+  theme_minimal()
+
+```
+
+Team summary
+```{r}
+team_summary <- final_week_summary %>%
+  group_by(qb) %>%
+  summarize(
+    avg_yards_gained = mean(yards_gained, na.rm = TRUE),
+    avg_max_neg_change = mean(max_neg_change, na.rm = TRUE)
+  )
+
+ggplot(team_summary, aes(x = abs(avg_max_neg_change), y = avg_yards_gained)) +
+  geom_point(color = "steelblue", size = 3) +
+  geom_smooth(method = "lm", se = TRUE, color = "black") +
+  labs(
+    title = "Team Avg Yards Gained vs Avg PRSS",
+    x = "Avg PRSS",
+    y = "Avg Yards Gained"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
+
+# Example: label top 3 and bottom 3 by avg_yards_gained
+label_qbs <- team_summary %>%
+  arrange(desc(avg_yards_gained)) %>%
+  slice_head(n = 3) %>%
+  bind_rows(
+    team_summary %>% arrange(avg_yards_gained) %>% slice_head(n = 3)
+  )
+
+```
+
+Binning
+```{r}
+# Bin the max_neg_change into evenly spaced intervals
+binned_summary <- final_week_summary %>%
+  mutate(bin = cut(abs(max_neg_change), breaks = seq(0, max(abs(max_neg_change), na.rm = TRUE), by = 2))) %>%
+  group_by(bin) %>%
+  summarise(
+    avg_neg_change = mean(abs(max_neg_change), na.rm = TRUE),
+    avg_yards_gained = mean(yards_gained, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Plot the binned data with a line
+ggplot(binned_summary, aes(x = avg_neg_change, y = avg_yards_gained)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "darkred", size = 2) +
+  labs(
+    title = "Binned Avg Yards Gained vs Max Pocket Area Collapse",
+    x = "Avg Max Negative Pocket Area Change (per bin)",
+    y = "Avg Yards Gained"
+  ) +
+  theme_minimal()
+
+# Linear model on binned data
+lm_model <- lm(avg_yards_gained ~ avg_neg_change, data = binned_summary)
+summary(lm_model)  # To view coefficients and R-squared
+
+# Correlation coefficient
+correlation <- cor(binned_summary$avg_neg_change, binned_summary$avg_yards_gained, use = "complete.obs")
+print(paste("Correlation:", round(correlation, 3)))
+```
+
+```{r}
+# Plot: just points + regression line
+ggplot(binned_summary, aes(x = avg_neg_change, y = avg_yards_gained)) +
+  geom_point(color = "darkred", size = 2) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue", size = 1) +
+  labs(
+    title = "Regression on Binned Avg Yards Gained vs Pocket Area Collapse",
+    x = "Avg Max Negative Pocket Area Change (per bin)",
+    y = "Avg Yards Gained"
+  ) +
+  theme_minimal()
+
+ggplot(binned_summary, aes(x = avg_neg_change, y = avg_yards_gained)) +
+  geom_point(color = "darkred", size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "blue", fill = "lightblue", size = 1) +
+  labs(
+    title = "Regression on Binned Avg Yards Gained vs Avg PRSS",
+    x = "Avg PRSS (per bin)",
+    y = "Avg Yards Gained"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title = element_text(size = 16, face = "bold"),
+    axis.text = element_text(size = 14)
+  )
+
+lm_fit <- lm(avg_yards_gained ~ avg_neg_change, data = binned_summary)
+  summary(lm_fit)
+
+plays_team <- plays %>% select(gameId, playId, possessionTeam)
+```
+
+Team level summary
+```{r}
+# Add team to final_week_summary
+final_week_summary <- final_week_summary %>%
+  left_join(plays_team, by = c("gameId", "playId"))
+
+# Team-level summary
+team_summary <- final_week_summary %>%
+  group_by(possessionTeam) %>%
+  summarise(
+    avg_yards = mean(yards_gained, na.rm = TRUE),
+    avg_neg_change = mean(abs(max_neg_change), na.rm = TRUE),
+    count = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(avg_yards)) %>%
+  mutate(
+    yards_rank = rank(-avg_yards),
+    pressure_rank = rank(avg_neg_change)
+  )
+
+team_rolling_summary <- final_week_summary %>%
+  group_by(possessionTeam.x) %>%
+  summarise(
+    avg_max_neg_change = mean(max_neg_change, na.rm = TRUE),
+    play_count = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(avg_max_neg_change)
+
+team_rolling_summary <- team_rolling_summary %>%
+  mutate(pressure_rank = rank(avg_max_neg_change))
+
+ggplot(team_rolling_summary, aes(x = reorder(possessionTeam.x, avg_max_neg_change), y = abs(avg_max_neg_change))) +
+  geom_col(fill = "tomato") +
+  labs(
+    title = "Avg PRSS by Team",
+    x = "Team",
+    y = "Avg Max Net Change"
+  ) +
+  coord_flip() +
+  theme_minimal()
+
+```
+
+Team + bin averages w outliers
+```{r}
+# 1. Bin max_neg_change and calculate team+bin averages
+binned_team_summary <- final_week_summary %>%
+  mutate(bin = cut(abs(max_neg_change), breaks = seq(0, max(abs(max_neg_change), na.rm = TRUE), by = 18))) %>%
+  filter(!is.na(bin), !is.na(possessionTeam.x)) %>%
+  group_by(possessionTeam.x, bin) %>%
+  summarise(
+    avg_neg_change = mean(abs(max_neg_change), na.rm = TRUE),
+    avg_yards = mean(yards_gained, na.rm = TRUE),
+    play_count = n(),
+    .groups = "drop"
+  )
+
+# 1. Add unique id to each row
+binned_team_summary <- binned_team_summary %>%
+  mutate(row_id = row_number())
+
+# 2. Fit regression and compute residuals
+lm_fit <- lm(avg_yards ~ avg_neg_change, data = binned_team_summary)
+binned_team_summary <- binned_team_summary %>%
+  mutate(residual = avg_yards - predict(lm_fit, newdata = binned_team_summary))
+
+# 3. Find outlier row_ids
+n_outliers <- 10
+outlier_row_ids <- binned_team_summary %>%
+  arrange(desc(residual)) %>% slice_head(n = n_outliers) %>%
+  bind_rows(
+    binned_team_summary %>% arrange(residual) %>% slice_head(n = n_outliers)
+  ) %>%
+  pull(row_id)
+
+# 4. Flag outliers in the main table
+binned_team_summary <- binned_team_summary %>%
+  mutate(is_outlier = row_id %in% outlier_row_ids)
+
+# 5. Plot: only outliers colored/labeled, rest gray
+ggplot(binned_team_summary, aes(x = avg_neg_change, y = avg_yards)) +
+  geom_point(
+    data = binned_team_summary %>% filter(!is_outlier),
+    color = "gray70",
+    size = 2,
+    alpha = 0.5
+  ) +
+  geom_point(
+    data = binned_team_summary %>% filter(is_outlier),
+    aes(color = possessionTeam.x),
+    size = 2.5,
+    alpha = 0.9
+  ) +
+  geom_text_repel(
+    data = binned_team_summary %>% filter(is_outlier),
+    aes(label = possessionTeam.x, color = possessionTeam.x),
+    size = 3,
+    show.legend = FALSE,
+    max.overlaps = 30
+  ) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", fill = "lightblue", size = 1.2) +
+  labs(
+    title = "Avg Yards Gained per PRSS Bin (Only Outlier Teams Labeled & Colored)",
+    x = "Avg PRSS (per 10-unit bin)",
+    y = "Avg Yards Gained"
+  ) +
+  theme_minimal() +
+  guides(color = guide_legend(title = "Outlier Team"))
+```
+
