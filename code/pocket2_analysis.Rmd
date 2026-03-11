@@ -1,0 +1,270 @@
+---
+title: "QB Pocket Pressure Analysis (PRSS) — Rolling Window Comparison"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+## 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(nflfastR)
+library(zoo)
+library(ggrepel)
+```
+
+---
+
+## 2. Load pre-computed RDS data
+
+```{r load-rds, message=FALSE}
+# Load pre-computed PRSS results (no need to recompute)
+all_summary_k5   <- readRDS("../data/processed/all_summary_k5.rds")
+all_summaries    <- readRDS("../data/processed/all_summaries_all_windows.rds")
+
+# Load supporting CSVs (small, fast to read)
+plays   <- read_csv("../data/bdb/plays.csv",           show_col_types = FALSE)
+players <- read_csv("../data/bdb/players.csv",          show_col_types = FALSE)
+pff     <- read_csv("../data/bdb/pffScoutingData.csv",  show_col_types = FALSE)
+```
+
+---
+
+## 3. Build PFF pressure labels
+
+```{r pff-pressure}
+pff_pressure <- pff %>%
+  filter(pff_role == "Pass Rush") %>%
+  group_by(gameId, playId) %>%
+  summarise(
+    actual_pressure = as.integer(any(pff_hit == 1 | pff_hurry == 1 | pff_sack == 1, na.rm = TRUE)),
+    n_rushers       = n(),
+    .groups = "drop"
+  )
+```
+
+---
+
+## 4. Merge k=5 summary with plays & PFF
+
+```{r merge-k5}
+final_data <- all_summary_k5 %>%
+  filter(!is.na(max_neg_change), !is.na(qb)) %>%
+  left_join(
+    plays %>% select(gameId, playId, possessionTeam, passResult, prePenaltyPlayResult),
+    by = c("gameId", "playId")
+  ) %>%
+  left_join(pff_pressure, by = c("gameId", "playId"))
+```
+
+---
+
+## 5. Merge all-windows summary with plays
+
+```{r merge-all-windows}
+all_summaries_final <- all_summaries %>%
+  filter(!is.na(max_neg_change), !is.na(qb)) %>%
+  left_join(
+    plays %>% select(gameId, playId, possessionTeam, passResult, prePenaltyPlayResult),
+    by = c("gameId", "playId")
+  )
+
+# Quick sanity check
+all_summaries_final %>%
+  group_by(window) %>%
+  summarise(
+    n         = n(),
+    na_count  = sum(is.na(max_neg_change)),
+    mean_prss = mean(max_neg_change, na.rm = TRUE),
+    sd_prss   = sd(max_neg_change,   na.rm = TRUE)
+  )
+```
+
+---
+
+## 6. Merge nflfastR play-by-play (EPA, yards)
+
+```{r merge-pbp, message=FALSE}
+pbp <- load_pbp(2021) %>%
+  mutate(
+    gameId = as.numeric(old_game_id),
+    playId = as.numeric(play_id)
+  ) %>%
+  select(gameId, playId, epa, yards_gained, cpoe, air_yards)
+
+all_summaries_final <- all_summaries_final %>%
+  left_join(pbp, by = c("gameId", "playId"))
+
+# Confirm join worked
+message("Rows with EPA: ", sum(!is.na(all_summaries_final$epa)))
+```
+
+---
+
+## 7. Plots
+
+### Plot 1: PRSS Distribution (k=5)
+
+```{r plot-dist-k5}
+ggplot(final_data, aes(x = max_neg_change)) +
+  geom_histogram(bins = 50, fill = "steelblue", alpha = 0.8) +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
+  labs(
+    title = "Distribution of PRSS (k=5)",
+    x     = "PRSS (negative = pocket collapsing)",
+    y     = "Count"
+  ) +
+  theme_minimal()
+```
+
+---
+
+### Plot 2: PRSS vs Play Result (k=5)
+
+```{r plot-prss-yards}
+ggplot(final_data, aes(x = max_neg_change, y = prePenaltyPlayResult)) +
+  geom_point(alpha = 0.2, color = "lightcoral") +
+  geom_smooth(method = "lm", color = "black") +
+  labs(
+    title = "PRSS vs Play Result (yards gained)",
+    x     = "PRSS",
+    y     = "Yards Gained"
+  ) +
+  theme_minimal()
+
+cor(final_data$max_neg_change, final_data$prePenaltyPlayResult, use = "complete.obs")
+```
+
+---
+
+### Plot 3: PRSS Distribution by Rolling Window Size
+
+```{r plot-density-windows}
+ggplot(all_summaries_final, aes(x = max_neg_change, fill = window, color = window)) +
+  geom_density(alpha = 0.25) +
+  xlim(-20, 10) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "PRSS Distribution by Rolling Window Size",
+    x     = "PRSS",
+    y     = "Density",
+    fill  = "Window (k)",
+    color = "Window (k)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+As the rolling window size increases, the PRSS distribution shifts rightward and becomes wider. k=3 is too reactive to noise; k=10 over-smooths and loses real pressure signals. k=5 or k=7 appears to be the sweet spot.
+
+---
+
+### Plot 4: Correlation with yards by window
+
+```{r corr-yards-window}
+all_summaries_final %>%
+  group_by(window) %>%
+  summarise(
+    correlation = cor(max_neg_change, prePenaltyPlayResult, use = "complete.obs"),
+    .groups = "drop"
+  )
+```
+
+---
+
+### Plot 5: PRSS by Pass Result (k=5)
+
+```{r plot-pass-result}
+prss_by_result <- all_summaries_final %>%
+  filter(window == "5", passResult %in% c("C", "I", "S", "IN")) %>%
+  mutate(passResult = factor(passResult,
+                             levels = c("S", "IN", "I", "C"),
+                             labels = c("Sack", "Interception", "Incomplete", "Complete")))
+
+ggplot(prss_by_result, aes(x = passResult, y = max_neg_change, fill = passResult)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "PRSS Distribution by Pass Result (k=5)",
+    x     = "Pass Result",
+    y     = "PRSS (more negative = more pressure)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+
+prss_by_result %>%
+  group_by(passResult) %>%
+  summarise(
+    mean_prss   = mean(max_neg_change,   na.rm = TRUE),
+    median_prss = median(max_neg_change, na.rm = TRUE),
+    n           = n()
+  )
+```
+
+---
+
+### Plot 6: PRSS vs EPA by window
+
+```{r corr-epa-window}
+all_summaries_final %>%
+  group_by(window) %>%
+  summarise(
+    correlation = cor(max_neg_change, epa, use = "complete.obs"),
+    n           = n(),
+    .groups     = "drop"
+  )
+```
+
+At the individual play level, PRSS shows very weak correlation with EPA across all window sizes (r ≈ 0.04–0.05). This is expected — pocket geometry is only one of many factors driving play outcomes. Analysis at the QB or team level (aggregating across many plays) is likely more informative.
+
+---
+
+### Plot 7: PRSS Validation vs PFF Pressure Labels (k=5)
+
+```{r plot-validation}
+validation_data <- all_summaries_final %>%
+  left_join(pff_pressure, by = c("gameId", "playId")) %>%
+  filter(!is.na(actual_pressure), window == "5")
+
+ggplot(validation_data,
+       aes(x = factor(actual_pressure, labels = c("No Pressure", "Pressure")),
+           y = abs(max_neg_change),
+           fill = factor(actual_pressure))) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  labs(
+    title = "PRSS: Actual Pressure vs No Pressure (k=5)",
+    x     = "PFF Pressure Label",
+    y     = "PRSS"
+  ) +
+  theme_minimal(base_size = 13)
+
+t.test(abs(max_neg_change) ~ actual_pressure, data = validation_data)
+```
+
+---
+
+### Plot 8: Team PRSS Ranking (k=5)
+
+```{r plot-team-prss}
+team_summary <- all_summaries_final %>%
+  filter(window == "5", !is.na(possessionTeam)) %>%
+  group_by(possessionTeam) %>%
+  summarise(
+    avg_prss  = mean(abs(max_neg_change), na.rm = TRUE),
+    avg_yards = mean(yards_gained,        na.rm = TRUE),
+    n_plays   = n(),
+    .groups   = "drop"
+  ) %>%
+  arrange(desc(avg_prss))
+
+ggplot(team_summary, aes(x = reorder(possessionTeam, avg_prss), y = avg_prss)) +
+  geom_col(fill = "tomato", alpha = 0.85) +
+  coord_flip() +
+  labs(
+    title = "Avg PRSS by Offensive Team (k=5)",
+    x     = "Team",
+    y     = "Avg PRSS (higher = more pocket collapse)"
+  ) +
+  theme_minimal(base_size = 12)
+```

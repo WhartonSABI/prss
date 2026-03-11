@@ -1,9 +1,11 @@
 ---
 title: "QB Pocket Pressure Analysis (PRSS) — Rolling Window Comparison"
-output: html_notebook
+output:
+  html_document:
+    df_print: paged
 ---
 
-## 1. 加载库
+## 1. setup
 
 ```{r setup, message=FALSE, warning=FALSE}
 library(tidyverse)
@@ -97,12 +99,12 @@ compute_qb_area <- function(play_data, k) {
 
   frames <- unique(play_data$frameId)
 
-  # 需要至少 k+1 帧才能计算滚动均值
+  # we need k+1
   if (length(frames) < (k + 1)) {
     return(tibble(qb = qb_name, max_neg_change = NA_real_))
   }
 
-  # 逐帧计算QB的Voronoi面积
+  # calculate QB's Voronoi area frame by frame
   qb_areas <- map_dfr(frames, function(f) {
     frame_data <- play_data %>%
       filter(
@@ -142,7 +144,7 @@ compute_qb_area <- function(play_data, k) {
 
 ---
 
-## 5. 对 k = 3, 5, 7, 10 批量计算
+## 5.  k = 3, 5, 7, 10 
 
 ### k=5
 ```{r}
@@ -161,9 +163,10 @@ all_summary_k5 <- bind_rows(results) %>%
   bind_cols(play_list %>% select(gameId, playId))
 
 
-# 跑完立刻保存，防止丢失
+# save
 saveRDS(all_summary_k5, "../data/processed/all_summary_k5.rds")
 ```
+
 ```{r}
 final_data <- all_summary_k5 %>%
   filter(!is.na(max_neg_change), !is.na(qb)) %>%
@@ -176,7 +179,7 @@ final_data <- all_summary_k5 %>%
 ```
 
 ```{r}
-# 画第一张图：PRSS 分布
+# plot1: PRSS Distribution
 ggplot(final_data, aes(x = max_neg_change)) +
   geom_histogram(bins = 50, fill = "steelblue", alpha = 0.8) +
   geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
@@ -189,7 +192,7 @@ ggplot(final_data, aes(x = max_neg_change)) +
 ```
 
 ```{r}
-# 画第二张图：PRSS vs playResult
+# PRSS vs playResult
 ggplot(final_data, aes(x = max_neg_change, y = prePenaltyPlayResult)) +
   geom_point(alpha = 0.2, color = "lightcoral") +
   geom_smooth(method = "lm", color = "black") +
@@ -200,15 +203,15 @@ ggplot(final_data, aes(x = max_neg_change, y = prePenaltyPlayResult)) +
   ) +
   theme_minimal()
 
-# 简单相关性
+# correlation
 cor(final_data$max_neg_change, final_data$prePenaltyPlayResult, use = "complete.obs")
 ```
 
 ```{r}
-# k=5 已有，直接复用
+# k=5 
 k5 <- all_summary_k5 %>% mutate(window = as.factor(5))
 
-# 只跑 k=3, 7, 10
+# k=3, 7, 10
 window_sizes <- c(3, 7, 10)
 all_results <- vector("list", length(window_sizes))
 
@@ -228,7 +231,7 @@ for (w in seq_along(window_sizes)) {
     mutate(window = as.factor(k))
 }
 
-# 合并所有窗口包括k=5
+# combine all windows
 all_summaries <- bind_rows(all_results) %>%
   bind_rows(k5)
 
@@ -237,10 +240,9 @@ saveRDS(all_summaries, "../data/processed/all_summaries_all_windows.rds")
 
 ## 6. review the k 
 ```{r}
-# 读入
+# load
 all_summaries <- readRDS("../data/processed/all_summaries_all_windows.rds")
 
-# 合并 plays 数据
 all_summaries_final <- all_summaries %>%
   filter(!is.na(max_neg_change), !is.na(qb)) %>%
   left_join(
@@ -249,7 +251,6 @@ all_summaries_final <- all_summaries %>%
     by = c("gameId", "playId")
   )
 
-# 看基本情况
 all_summaries_final %>%
   group_by(window) %>%
   summarise(
@@ -262,10 +263,10 @@ all_summaries_final %>%
 
 ## PRSS visualization
 ```{r}
-# 图1：四个窗口PRSS分布对比
+# plot1: PRSS Distribution (4 windows comparison)
 ggplot(all_summaries_final, aes(x = max_neg_change, fill = window, color = window)) +
   geom_density(alpha = 0.25) +
-  xlim(-20, 10) +  # 去掉极端值方便看
+  xlim(-20, 10) +  
   geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
   labs(
     title = "PRSS Distribution by Rolling Window Size",
@@ -286,7 +287,7 @@ The next step is to check which k value produces the strongest correlation with 
 
 ```{r}
 
-# 图2：各窗口与yards的相关性
+# plot2：the correlation between yards and windows
 all_summaries_final %>%
   group_by(window) %>%
   summarise(
@@ -301,14 +302,14 @@ The choice of k barely matters for predicting yards gained at the play level. Al
 
 ```{r}
 
-# 只用k=5，filter掉scramble
+# only k=5，filter scramble
 prss_by_result <- all_summaries_final %>%
   filter(window == '5', passResult %in% c("C", "I", "S", "IN")) %>%
   mutate(passResult = factor(passResult, 
                              levels = c("S", "IN", "I", "C"),
                              labels = c("Sack", "Interception", "Incomplete", "Complete")))
 
-# 箱线图
+# boxplot
 ggplot(prss_by_result, aes(x = passResult, y = max_neg_change, fill = passResult)) +
   geom_boxplot(alpha = 0.7, outlier.alpha = 0.2) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
@@ -320,7 +321,7 @@ ggplot(prss_by_result, aes(x = passResult, y = max_neg_change, fill = passResult
   theme_minimal(base_size = 13) +
   theme(legend.position = "none")
 
-# 各组均值
+# mean
 prss_by_result %>%
   group_by(passResult) %>%
   summarise(
@@ -330,7 +331,7 @@ prss_by_result %>%
   )
 
 ```
-## 6. 合并外部数据
+## 6. join external data
 
 ```{r merge-data, message=FALSE}
 library(nflfastR)
@@ -346,7 +347,6 @@ pbp <- load_pbp(2021) %>%
 all_summaries_final <- all_summaries_final %>%
   left_join(pbp, by = c("gameId", "playId"))
 
-# 确认join成功
 sum(!is.na(all_summaries_final$epa))
 ```
 
