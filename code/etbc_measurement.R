@@ -32,7 +32,7 @@ out_csv <- file.path(root, "data", "processed", "etbc_per_rusher_frame.csv")
 # --- Tunable parameters ------------------------------------------------------
 CONTACT_RADIUS  <- 1.0    # yards — distance at which we declare "contact"
 MAX_ETBC        <- 10.0   # seconds — cap for plotting / aggregation sanity
-SAMPLE_N        <- 500L   # number of plays to sample (matches qb_cell_measurement.R)
+SAMPLE_N        <- Inf    # Inf = use all valid plays (production run)
 FPS             <- 10     # tracking data frames per second
 # -----------------------------------------------------------------------------
 
@@ -103,10 +103,13 @@ valid_plays <- event_frames %>%
 
 cat("Valid plays available:", nrow(valid_plays), "\n")
 
-sampled_plays <- valid_plays %>%
-  slice_sample(n = min(SAMPLE_N, nrow(valid_plays)))
+sampled_plays <- if (is.infinite(SAMPLE_N)) {
+  valid_plays
+} else {
+  valid_plays %>% slice_sample(n = min(SAMPLE_N, nrow(valid_plays)))
+}
 
-cat("Sampled plays:", nrow(sampled_plays), "\n")
+cat("Plays to process:", nrow(sampled_plays), "\n")
 
 # =============================================================================
 # Main computation: per rusher, per frame, compute E[TBC]
